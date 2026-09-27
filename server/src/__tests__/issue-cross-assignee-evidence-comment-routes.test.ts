@@ -63,7 +63,66 @@ const mockIssueRecoveryActionService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
+const mockIssueTreeControlService = vi.hoisted(() => ({
+  getActivePauseHoldGate: vi.fn(async () => null),
+}));
+
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
+
+const mockExternalObjectService = vi.hoisted(() => ({
+  syncCommentSafely: vi.fn(async () => undefined),
+  syncIssueSafely: vi.fn(async () => undefined),
+}));
+
+const mockObserveCrossIssueInfluence = vi.hoisted(() =>
+  vi.fn(async () => ({
+    allowed: true,
+    mode: "log_only",
+    count: 1,
+    cap: 20,
+    enforceAt: "2026-08-11T00:00:00.000Z",
+  })),
+);
+const mockCrossIssueInfluenceLimitError = vi.hoisted(() =>
+  vi.fn((decision: { count: number; cap: number }) => ({
+    error: `Cross-issue influence cap exceeded: this run is limited to ${decision.cap} cross-issue comments or updates`,
+    details: {
+      code: "cross_issue_influence_cap_exceeded",
+      count: decision.count,
+      cap: decision.cap,
+    },
+  })),
+);
+const mockCrossIssueInfluenceRunContextError = vi.hoisted(() =>
+  vi.fn(
+    () =>
+      new Error(
+        "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",
+      ),
+  ),
+);
+
 function registerRouteMocks() {
+  vi.doMock("../services/runner-goals.js", () => ({
+    runnerGoalService: () => mockRunnerGoalService,
+  }));
+
+  vi.doMock("../services/queued-interaction-response.js", () => ({
+    hasQueuedInteractionResponse: vi.fn(async () => false),
+  }));
+
+  vi.doMock("../services/external-objects.js", () => ({
+    externalObjectService: () => mockExternalObjectService,
+  }));
+
+  vi.doMock("../services/cross-issue-influence-limit.js", () => ({
+    observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
+    crossIssueInfluenceLimitError: mockCrossIssueInfluenceLimitError,
+    crossIssueInfluenceRunContextError: mockCrossIssueInfluenceRunContextError,
+  }));
   vi.doMock("@paperclipai/shared/telemetry", () => ({
     trackAgentTaskCompleted: vi.fn(),
     trackErrorHandlerCrash: vi.fn(),
@@ -96,7 +155,10 @@ function registerRouteMocks() {
     agentService: () => mockAgentService,
     clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
     companyService: () => mockCompanyService,
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+    companySkillService: () => ({
+      listRuntimeSkillEntries: vi.fn(),
+      completeTestRunForIssue: vi.fn(async () => null),
+    }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
@@ -133,6 +195,7 @@ function registerRouteMocks() {
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
+    issueTreeControlService: () => mockIssueTreeControlService,
     logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
@@ -225,6 +288,10 @@ describe("cross-assignee evidence comments", () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
+    vi.doUnmock("../services/runner-goals.js");
+    vi.doUnmock("../services/queued-interaction-response.js");
+    vi.doUnmock("../services/external-objects.js");
+    vi.doUnmock("../services/cross-issue-influence-limit.js");
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/agents.js");
@@ -332,6 +399,7 @@ describe("cross-assignee evidence comments", () => {
           crossAssignee: { trigger: "linked_checkout", viaIssueId: linkedIssueId },
         },
       }),
+      expect.anything(),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
@@ -368,6 +436,7 @@ describe("cross-assignee evidence comments", () => {
           crossAssignee: { trigger: "mention", viaIssueId: null },
         },
       }),
+      expect.anything(),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
@@ -378,7 +447,7 @@ describe("cross-assignee evidence comments", () => {
       .send({ body: "no relationship to this issue" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toContain("not visible to this agent");
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -390,7 +459,7 @@ describe("cross-assignee evidence comments", () => {
       .send({ body: "no relationship to this issue" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toContain("not visible to this agent");
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -433,6 +502,7 @@ describe("cross-assignee evidence comments", () => {
           crossAssignee: { trigger: "linked_checkout", viaIssueId: linkedIssueId },
         }),
       }),
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -503,6 +573,7 @@ describe("cross-assignee evidence comments", () => {
       "owner status update",
       expect.any(Object),
       expect.objectContaining({ metadata: null }),
+      expect.anything(),
     );
   });
 });
