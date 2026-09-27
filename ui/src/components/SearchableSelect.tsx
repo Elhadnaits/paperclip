@@ -225,14 +225,15 @@ export function SearchableSelect<
         </Button>
       </PopoverTrigger>
       <PopoverContent
+        data-mobile-entity-picker=""
         align={align}
         collisionPadding={16}
         disablePortal={disablePortal}
         className={cn(
           "p-0",
           contentWidth === "trigger"
-            ? "w-[var(--radix-popover-trigger-width)] min-w-56 max-w-[min(32rem,calc(100vw-2rem))]"
-            : "w-72 max-w-[min(32rem,calc(100vw-2rem))]",
+            ? "w-(--radix-popover-trigger-width) min-w-56 max-w-(--sz-calc-23)"
+            : "w-72 max-w-(--sz-calc-23)",
           contentClassName,
         )}
         onKeyDownCapture={(event) => {
