@@ -8831,7 +8831,7 @@ export function buildWorkspaceReadyPresentation(
 export function buildWorkspaceReadyMetadata(
   input: WorkspaceReadyCommentInput,
 ): IssueCommentMetadata {
-  const workspaceRows: NonNullable<IssueCommentMetadata["sections"]>[number]["rows"] = [
+  const workspaceRows: IssueCommentMetadata["sections"][number]["rows"] = [
     { type: "key_value", label: "Strategy", value: input.workspace.strategy },
     ...(input.workspace.branchName
       ? [{ type: "key_value" as const, label: "Branch", value: input.workspace.branchName }]
@@ -8841,7 +8841,7 @@ export function buildWorkspaceReadyMetadata(
       ? [{ type: "key_value" as const, label: "Worktree", value: input.workspace.worktreePath }]
       : []),
   ];
-  const serviceRows: NonNullable<IssueCommentMetadata["sections"]>[number]["rows"] = input.runtimeServices.map(
+  const serviceRows: IssueCommentMetadata["sections"][number]["rows"] = input.runtimeServices.map(
     (service) => ({
       type: "key_value",
       label: workspaceReadyServiceLabel(service.serviceName),

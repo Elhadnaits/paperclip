@@ -9,6 +9,7 @@ const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const peerRunId = "66666666-6666-4666-8666-666666666666";
 const linkedIssueId = "88888888-8888-4888-8888-888888888888";
 const commentId = "77777777-7777-4777-8777-777777777777";
+const workspaceId = "99999999-9999-4999-8999-999999999999";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -23,7 +24,6 @@ const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   update: vi.fn(),
-  wasAgentMentionedOnIssue: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -48,6 +48,16 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+}));
+
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+  reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(async () => ({
+    ok: true,
+    reopened: true,
+    generation: 1,
+  })),
+  clearReopenPendingForIssue: vi.fn(async () => undefined),
 }));
 
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
@@ -161,7 +171,7 @@ function registerRouteMocks() {
     }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -221,6 +231,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     title: "Owned issue awaiting evidence",
     executionPolicy: null,
     executionState: null,
+    executionWorkspaceId: null,
     hiddenAt: null,
     ...overrides,
   };
@@ -283,6 +294,82 @@ function peerActor(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Mirror master's `issue:comment` decision for a standard-trust agent: the
+ * assignee is allowed as itself, everyone else is default-opened on a visible
+ * issue (`allow_visible_issue_write`) unless a test overrides the reason.
+ */
+function allowPeerComments(reason = "allow_visible_issue_write") {
+  mockAccessService.decide.mockImplementation(async (input: {
+    action: string;
+    actor?: { agentId?: string | null };
+    resource?: { assigneeAgentId?: string | null };
+  }) => {
+    if (input.action === "issue:comment") {
+      const assigneeAgentId = input.resource?.assigneeAgentId ?? null;
+      const self = !assigneeAgentId || assigneeAgentId === input.actor?.agentId;
+      return {
+        allowed: true,
+        action: input.action,
+        reason: self ? "allow_self" : reason,
+        explanation: "Allowed by test default.",
+      };
+    }
+    return {
+      allowed: input.action === "issue:mutate" || input.action === "issue:read",
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test default.",
+    };
+  });
+}
+
+function denyPeerComments() {
+  mockAccessService.decide.mockImplementation(async (input: {
+    action: string;
+    actor?: { agentId?: string | null };
+    resource?: { assigneeAgentId?: string | null };
+  }) => {
+    if (input.action === "issue:comment") {
+      const assigneeAgentId = input.resource?.assigneeAgentId ?? null;
+      const allowed = !assigneeAgentId || assigneeAgentId === input.actor?.agentId;
+      return {
+        allowed,
+        action: input.action,
+        reason: allowed ? "allow_self" : "deny_missing_grant",
+        explanation: allowed ? "Allowed by test default." : "Denied by test default.",
+      };
+    }
+    return {
+      allowed: input.action === "issue:mutate" || input.action === "issue:read",
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test default.",
+    };
+  });
+}
+
+function crossAssigneeMetadata(
+  trigger: "linked_checkout" | "mention" | "visible_issue",
+  viaIssueId: string | null,
+) {
+  return {
+    version: 1,
+    crossAssignee: { trigger, viaIssueId },
+    sections: [
+      {
+        title: "Cross-assignee evidence",
+        rows: [
+          { type: "key_value", label: "Trigger", value: trigger },
+          ...(viaIssueId
+            ? [{ type: "issue_link", label: "Evidence from", issueId: viaIssueId }]
+            : []),
+        ],
+      },
+    ],
+  };
+}
+
 describe("cross-assignee evidence comments", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -303,30 +390,7 @@ describe("cross-assignee evidence comments", () => {
     registerRouteMocks();
     vi.clearAllMocks();
 
-    mockAccessService.decide.mockImplementation(async (input: {
-      action: string;
-      actor?: { agentId?: string | null };
-      resource?: { assigneeAgentId?: string | null };
-    }) => {
-      if (input.action === "issue:comment") {
-        // Mirror master's issue:comment semantics: assignee (or unassigned
-        // issues) allowed, peer agents denied unless a mention grant applies.
-        const assigneeAgentId = input.resource?.assigneeAgentId ?? null;
-        const allowed = !assigneeAgentId || assigneeAgentId === input.actor?.agentId;
-        return {
-          allowed,
-          action: input.action,
-          reason: allowed ? "allow_self" : "deny_missing_grant",
-          explanation: allowed ? "Allowed by test default." : "Denied by test default.",
-        };
-      }
-      return {
-        allowed: input.action === "issue:mutate" || input.action === "issue:read",
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test default.",
-      };
-    });
+    allowPeerComments();
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAgentService.getById.mockImplementation(async (id: string) => {
@@ -341,7 +405,6 @@ describe("cross-assignee evidence comments", () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue(null);
-    mockIssueService.wasAgentMentionedOnIssue.mockResolvedValue(false);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getDependencyReadiness.mockResolvedValue({
       issueId,
@@ -370,11 +433,17 @@ describe("cross-assignee evidence comments", () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+      ok: true,
+      reopened: true,
+      generation: 1,
+    });
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
-  it("allows a peer agent with a linked checked-out issue to append an evidence comment", async () => {
+  it("stamps a peer comment from a linked checked-out issue with its evidence source", async () => {
     mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
 
     const res = await request(await createApp(peerActor()))
@@ -394,10 +463,7 @@ describe("cross-assignee evidence comments", () => {
       "evidence from my linked checkout",
       expect.objectContaining({ agentId: peerAgentId, runId: peerRunId }),
       expect.objectContaining({
-        metadata: {
-          version: 1,
-          crossAssignee: { trigger: "linked_checkout", viaIssueId: linkedIssueId },
-        },
+        metadata: crossAssigneeMetadata("linked_checkout", linkedIssueId),
       }),
       expect.anything(),
     );
@@ -409,6 +475,9 @@ describe("cross-assignee evidence comments", () => {
         agentId: peerAgentId,
         runId: peerRunId,
         details: expect.objectContaining({
+          // The gate's own reason is what authorized the write; the stamp is
+          // additive attribution, never a reason of its own.
+          authorizationReason: "allow_visible_issue_write",
           crossAssignee: true,
           crossAssigneeTrigger: "linked_checkout",
           crossAssigneeViaIssueId: linkedIssueId,
@@ -417,131 +486,137 @@ describe("cross-assignee evidence comments", () => {
     );
   });
 
-  it("allows a peer agent mentioned on the target issue to append an evidence comment", async () => {
-    mockIssueService.wasAgentMentionedOnIssue.mockResolvedValue(true);
+  it("labels a mention-granted peer comment as a mention", async () => {
+    allowPeerComments("allow_issue_mention_grant");
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/comments`)
       .send({ body: "responding to the mention" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
-    expect(mockIssueService.wasAgentMentionedOnIssue).toHaveBeenCalledWith(issueId, peerAgentId);
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
       "responding to the mention",
       expect.any(Object),
-      expect.objectContaining({
-        metadata: {
-          version: 1,
-          crossAssignee: { trigger: "mention", viaIssueId: null },
-        },
-      }),
+      expect.objectContaining({ metadata: crossAssigneeMetadata("mention", null) }),
       expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        details: expect.objectContaining({
+          authorizationReason: "allow_issue_mention_grant",
+          crossAssigneeTrigger: "mention",
+        }),
+      }),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("keeps rejecting peer comments without a link or mention on an active checkout", async () => {
+  it("labels a default-open peer comment without a link or mention as a visible-issue write", async () => {
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/comments`)
-      .send({ body: "no relationship to this issue" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("not visible to this agent");
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
-  });
-
-  it("keeps rejecting peer comments without a link or mention on a todo issue", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
-
-    const res = await request(await createApp(peerActor()))
-      .post(`/api/issues/${issueId}/comments`)
-      .send({ body: "no relationship to this issue" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("not visible to this agent");
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
-  });
-
-  it("does not grant cross-assignee access when the authorization boundary denies the issue", async () => {
-    mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
-    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
-      allowed: false,
-      action: input.action,
-      reason: "deny_missing_grant",
-      explanation: "Denied by test.",
-    }));
-
-    const res = await request(await createApp(peerActor()))
-      .post(`/api/issues/${issueId}/comments`)
-      .send({ body: "outside my boundary" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
-  });
-
-  it("does not reopen a done issue from a cross-assignee comment, even with reopen/resume intents", async () => {
-    // Regression (R1): effectiveMoveToTodoRequested must stay false for
-    // cross-assignee comments — a cross-assignee comment on a done issue
-    // must append only, never move the issue back to todo.
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done" }));
-    mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
-
-    const res = await request(await createApp(peerActor()))
-      .post(`/api/issues/${issueId}/comments`)
-      .send({ body: "late evidence on a closed issue", reopen: true, resume: true });
+      .send({ body: "context from a visible issue" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "context from a visible issue",
+      expect.any(Object),
+      expect.objectContaining({ metadata: crossAssigneeMetadata("visible_issue", null) }),
+      expect.anything(),
+    );
+  });
+
+  it("keeps the direct-parent report grant visible in the audit trail", async () => {
+    allowPeerComments("allow_direct_parent_report");
+    mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "report to my parent" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        details: expect.objectContaining({
+          authorizationReason: "allow_direct_parent_report",
+          directParentReportGrant: true,
+          crossAssignee: true,
+          crossAssigneeTrigger: "linked_checkout",
+        }),
+      }),
+    );
+  });
+
+  it("never widens access: a link cannot turn a denied comment into a grant", async () => {
+    denyPeerComments();
+    mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "no grant for this issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("not visible to this agent");
+    expect(mockIssueService.findCrossAssigneeEvidenceLink).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("appends to a done issue with a closed workspace without reopening either", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "done", executionWorkspaceId: workspaceId }),
+    );
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: workspaceId,
+      mode: "isolated_workspace",
+      status: "archived",
+      closedAt: new Date("2026-09-01T00:00:00.000Z"),
+    });
+    mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "late evidence on a closed issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
       "late evidence on a closed issue",
       expect.any(Object),
       expect.objectContaining({
-        metadata: expect.objectContaining({
-          crossAssignee: { trigger: "linked_checkout", viaIssueId: linkedIssueId },
-        }),
+        metadata: crossAssigneeMetadata("linked_checkout", linkedIssueId),
       }),
       expect.anything(),
-    );
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        action: "issue.comment_added",
-        details: expect.objectContaining({
-          suppressedCrossAssigneeIntents: ["reopen", "resume"],
-        }),
-      }),
     );
     expect(mockLogActivity).not.toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({
-        action: "issue.updated",
-      }),
+      expect.objectContaining({ action: "issue.updated" }),
     );
     // Flush the async wake dispatch before asserting no wake happened.
     await new Promise((resolve) => setImmediate(resolve));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("suppresses interrupt intents on cross-assignee comments instead of cancelling runs", async () => {
+  it("leaves intent-bearing peer comments to their existing gates instead of stamping them", async () => {
     mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue({ viaIssueId: linkedIssueId });
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/comments`)
-      .send({ body: "evidence with stray interrupt flag", interrupt: true });
+      .send({ body: "evidence with a stray interrupt flag", interrupt: true });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Only board users can interrupt");
+    expect(mockIssueService.findCrossAssigneeEvidenceLink).not.toHaveBeenCalled();
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        action: "issue.comment_added",
-        details: expect.objectContaining({
-          suppressedCrossAssigneeIntents: ["interrupt"],
-        }),
-      }),
-    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("wakes the assignee for cross-assignee evidence comments on open issues", async () => {
@@ -567,7 +642,6 @@ describe("cross-assignee evidence comments", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockIssueService.findCrossAssigneeEvidenceLink).not.toHaveBeenCalled();
-    expect(mockIssueService.wasAgentMentionedOnIssue).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
       "owner status update",

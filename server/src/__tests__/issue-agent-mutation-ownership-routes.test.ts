@@ -37,7 +37,6 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
   findCrossAssigneeEvidenceLink: vi.fn(),
-  wasAgentMentionedOnIssue: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -695,8 +694,6 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.findCrossAssigneeEvidenceLink.mockReset();
     mockIssueService.findCrossAssigneeEvidenceLink.mockResolvedValue(null);
-    mockIssueService.wasAgentMentionedOnIssue.mockReset();
-    mockIssueService.wasAgentMentionedOnIssue.mockResolvedValue(false);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue(),
       ...patch,

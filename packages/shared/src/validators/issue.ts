@@ -1000,7 +1000,7 @@ export const issueCommentMetadataSectionSchema = z
   .strict();
 
 export const issueCommentCrossAssigneeContextSchema = z.object({
-  trigger: z.enum(["linked_checkout", "mention"]),
+  trigger: z.enum(["linked_checkout", "mention", "visible_issue"]),
   viaIssueId: z.string().guid().nullable().optional(),
 }).strict();
 
@@ -1027,18 +1027,9 @@ export const issueCommentMetadataSchema = z
       assigneeAgentId: z.string().guid().nullable(),
     }).strict().optional(),
     crossAssignee: issueCommentCrossAssigneeContextSchema.nullable().optional(),
-    sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20).optional(),
+    sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
   })
-  .strict()
-  .superRefine((value, ctx) => {
-    if (!value.crossAssignee && !value.sections) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "sections are required unless crossAssignee context is present",
-        path: ["sections"],
-      });
-    }
-  });
+  .strict();
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 

@@ -2683,7 +2683,10 @@ function IssueChatAssistantMessage({
                 </Badge>
               ) : null}
               {crossAssignee ? (
-                <Badge variant="outline" className="text-[10px] uppercase tracking-[0.14em]">
+                <Badge
+                  variant="outline"
+                  className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow)"
+                >
                   Cross-assignee
                 </Badge>
               ) : null}

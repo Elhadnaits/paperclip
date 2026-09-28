@@ -321,7 +321,7 @@ function recoveryNoticeMetadata(input: {
   previousStatus: string;
   recoveryOwner?: Pick<typeof agents.$inferSelect, "id" | "name"> | null;
 }): IssueCommentMetadata {
-  const rows: NonNullable<IssueCommentMetadata["sections"]>[number]["rows"] = [
+  const rows: IssueCommentMetadata["sections"][number]["rows"] = [
     ...(input.recoveryActionId
       ? [
           {

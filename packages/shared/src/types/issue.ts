@@ -1065,8 +1065,12 @@ export interface IssueCommentMetadataSection {
   rows: IssueCommentMetadataRow[];
 }
 
+/**
+ * Attribution stamped on comment-only writes by a non-assignee agent. Never an
+ * authorization input: the comment gate decides access before this is derived.
+ */
 export interface IssueCommentCrossAssigneeContext {
-  trigger: "linked_checkout" | "mention";
+  trigger: "linked_checkout" | "mention" | "visible_issue";
   viaIssueId?: string | null;
 }
 
@@ -1087,8 +1091,7 @@ export interface IssueCommentMetadata {
     assigneeAgentId: string | null;
   };
   crossAssignee?: IssueCommentCrossAssigneeContext | null;
-  /** Required unless crossAssignee context is present (see issueCommentMetadataSchema). */
-  sections?: IssueCommentMetadataSection[];
+  sections: IssueCommentMetadataSection[];
 }
 
 export interface IssueCommentPresentation {

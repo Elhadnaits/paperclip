@@ -397,8 +397,8 @@ describe("issue validators", () => {
     expect(parsed.metadata?.sourceRunId).toBe(
       "11111111-1111-4111-8111-111111111111",
     );
-    expect(parsed.metadata?.sections?.[0]?.rows).toHaveLength(3);
-    expect(parsed.metadata?.sections?.[0]?.rows[2]).toMatchObject({
+    expect(parsed.metadata?.sections[0]?.rows).toHaveLength(3);
+    expect(parsed.metadata?.sections[0]?.rows[2]).toMatchObject({
       type: "run_link",
       agentId: "22222222-2222-4222-8222-222222222222",
     });

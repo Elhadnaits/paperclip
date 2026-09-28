@@ -27,7 +27,7 @@ export function readDispositionRecoverySnapshot(metadata: IssueCommentMetadata |
   if (!metadata || !action || action.kind !== "deliberate_wait_without_target" || action.ownerType !== "board" || action.wakePolicy?.type !== "board_escalation") return null;
   const evidence = action.evidence;
   if (!metadata.sourceRunId || metadata.sourceRunId !== evidence?.latestRunId) return null;
-  if (!metadata.sections?.some(section => section.rows.some(row => row.type === "key_value" && row.value === action.id))) return null;
+  if (!metadata.sections.some(section => section.rows.some(row => row.type === "key_value" && row.value === action.id))) return null;
   if (typeof evidence.terminalReason !== "string" || typeof evidence.sourceAttemptCount !== "number" || !Number.isInteger(evidence.sourceAttemptCount) || evidence.sourceAttemptCount < 0 || typeof evidence.sourceMaxAttempts !== "number" || !Number.isInteger(evidence.sourceMaxAttempts) || evidence.sourceMaxAttempts <= 0) return null;
   return { kind: "disposition_repair_escalated", actionId: action.id, attemptCount: evidence.sourceAttemptCount, maxAttempts: evidence.sourceMaxAttempts, reason: evidence.terminalReason, assigneeAgentId: action.returnOwnerAgentId };
 }
