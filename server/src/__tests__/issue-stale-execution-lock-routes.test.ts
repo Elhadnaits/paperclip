@@ -336,6 +336,14 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   it("allows successor mutations after adopting a terminal stale checkout lock", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = await insertLockedIssue({ companyId, agentId, checkoutRunId: failedRunId });
+    // The successor run's own comment/update writes on this issue are
+    // same-issue, not cross-issue — but the cross-issue containment gate
+    // (issue.cross_issue_influence_*) requires contextSnapshot.issueId to be
+    // set on the run before it can tell the two apart (see
+    // cross-issue-influence-limit.ts: readRunSourceIssueId).
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
     const app = createApp(agentActor(companyId, agentId, currentRunId));
 
     const checkoutRes = await request(app)
@@ -440,6 +448,12 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       },
     ]);
     const issueId = await insertLockedIssue({ companyId, agentId, checkoutRunId: liveOwnerRunId });
+    // Same-agent comments on this issue are same-issue writes, but the
+    // cross-issue containment gate still needs contextSnapshot.issueId on
+    // the acting run to recognize that (see cross-issue-influence-limit.ts).
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, successorRunId));
     const successorApp = createApp(agentActor(companyId, agentId, successorRunId));
 
     await request(successorApp)
