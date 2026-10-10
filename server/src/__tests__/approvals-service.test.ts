@@ -2,13 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { approvalService } from "../services/approvals.ts";
 import { companies } from "@paperclipai/db";
 
-vi.mock("../services/budgets.js", () => ({
+vi.mock("../services/budgets.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/budgets.js")>(),
   budgetService: () => ({ deliverPendingEnforcement: vi.fn(async () => {}) }),
   budgetServiceInTransaction: () => ({ upsertPolicy: vi.fn(async () => {}) }),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
+  getById: vi.fn(async () => ({ id: "agent-1" })),
   create: vi.fn(),
   terminate: vi.fn(),
 }));
@@ -16,8 +18,8 @@ const mockAgentService = vi.hoisted(() => ({
 const mockNotifyHireApproved = vi.hoisted(() => vi.fn());
 const mockCreateInstructionApplyTask = vi.hoisted(() => vi.fn());
 
-vi.mock("../services/agents.js", () => ({
-  agentService: vi.fn(() => mockAgentService),
+vi.mock("../modules/agent-lifecycle/adapters/records.js", () => ({
+  agentRecords: vi.fn(() => ({ ...mockAgentService, rejectPendingHire: mockAgentService.terminate })),
 }));
 
 vi.mock("../services/hire-hook.js", () => ({
@@ -35,6 +37,7 @@ type ApprovalRecord = {
   status: string;
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
+  requestedByUserId?: string | null;
 };
 
 function createApproval(status: string, type = "hire_agent"): ApprovalRecord {
@@ -48,10 +51,16 @@ function createApproval(status: string, type = "hire_agent"): ApprovalRecord {
   };
 }
 
-function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
+function createDbStub(
+  selectResults: ApprovalRecord[][],
+  updateResults: ApprovalRecord[],
+  options: { shiftOutsideTransaction?: boolean } = {},
+) {
   const pendingSelectResults = [...selectResults];
   let inTransaction = false;
-  const selectWhere = vi.fn(async () => (inTransaction ? pendingSelectResults.shift() : pendingSelectResults[0]) ?? []);
+  const selectWhere = vi.fn(async () =>
+    (inTransaction || options.shiftOutsideTransaction ? pendingSelectResults.shift() : pendingSelectResults[0]) ?? [],
+  );
   const from = vi.fn((table) => table === companies
     ? { where: () => ({ for: async () => [{ id: "company-1" }] }) }
     : { where: selectWhere });
@@ -118,7 +127,7 @@ describe("approvalService resolution idempotency", () => {
     const result = await svc.approve("approval-1", "board", "ship it");
 
     expect(result.applied).toBe(true);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload, approved.requestedByUserId);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
@@ -145,12 +154,17 @@ describe("approvalService resolution idempotency", () => {
   });
 
   it("does not create an apply task when an instruction-generation approve retry is a no-op", async () => {
+    // Non-hire approvals resolve outside a transaction on master: decide() reads
+    // once, resolveApproval() reads again, the conditional update matches no
+    // row (another worker won), then the re-read sees the approved record.
     const dbStub = createDbStub(
       [
+        [createApproval("pending", "instruction_generation")],
         [createApproval("pending", "instruction_generation")],
         [createApproval("approved", "instruction_generation")],
       ],
       [],
+      { shiftOutsideTransaction: true },
     );
 
     const svc = approvalService(dbStub.db as any);
@@ -172,9 +186,14 @@ describe("approvalService resolution idempotency", () => {
     expect(mockNotifyHireApproved).not.toHaveBeenCalled();
   });
 
-  it("creates the agent from payload when approval does not reference a pending agent", async () => {
+  it.each([
+    { requestedByAgentId: "requester-1", requestedByUserId: "on-behalf-user", expectedCreator: null },
+    { requestedByAgentId: null, requestedByUserId: "original-creator", expectedCreator: "original-creator" },
+  ])("creates a legacy approved hire with its original human attribution ($expectedCreator)", async ({ requestedByAgentId, requestedByUserId, expectedCreator }) => {
     const approved = {
       ...createApproval("approved"),
+      requestedByAgentId,
+      requestedByUserId,
       payload: {
         name: "New Agent",
         adapterConfig: {
@@ -199,6 +218,7 @@ describe("approvalService resolution idempotency", () => {
       expect.objectContaining({
         adapterConfig: approved.payload.adapterConfig,
       }),
+      { createdByUserId: expectedCreator, responsibleUserId: requestedByUserId },
     );
   });
 });
