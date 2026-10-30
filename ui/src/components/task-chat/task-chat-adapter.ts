@@ -135,6 +135,7 @@ export function commentsToTaskChatItems(
       } : {}),
       agent: effectiveAgentId(comment) ? ctx.agentMap?.get(effectiveAgentId(comment)!) ?? { id: effectiveAgentId(comment)! } : undefined,
       text: comment.body,
+      origin: comment.origin ?? "comment",
       sourceChannel: kind === "human" ? comment.metadata?.sourceChannel : undefined,
       timestamp: formatTaskChatCommentTimestamp(comment, kind),
       optimistic,
@@ -149,7 +150,7 @@ export function commentsToTaskChatItems(
       presentation: kind === "system" ? comment.presentation ?? null : undefined,
       metadata: kind === "system" ? comment.metadata ?? null : undefined,
       runAgentId: kind === "system" ? comment.runAgentId ?? null : undefined,
-      createdAtIso: kind === "system" ? createdAtIso : undefined,
+      createdAtIso,
     });
   }
   return items;
