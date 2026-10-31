@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, isNull, notInArray } from "drizzle-orm";
+import { and, eq, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -70,6 +70,11 @@ export function computeInstructionBundleFingerprint(
   return createHash("sha256").update(canonical).digest("hex");
 }
 
+/** Matches the `contentHash` the instructions-bundle file routes return (sha256 of the UTF-8 bytes). */
+function contentSha256(content: string): string {
+  return createHash("sha256").update(Buffer.from(content, "utf8")).digest("hex");
+}
+
 function buildApplyTaskDescription(input: {
   agentId: string;
   agentName: string;
@@ -88,6 +93,7 @@ function buildApplyTaskDescription(input: {
       const fence = "`".repeat(Math.max(4, longestBacktickRun + 1));
       return (
         `### \`${file.path}\`\n\n` +
+        `Expected \`contentHash\` after the write: \`${contentSha256(file.content)}\`\n\n` +
         fence +
         "markdown\n" +
         file.content +
@@ -107,16 +113,18 @@ function buildApplyTaskDescription(input: {
       : null,
     "## How to execute (board-authenticated callers only)",
     [
-      "For each approved file below, write it through the gated route:",
+      "For each approved file below, read its current state, then write it through the gated route:",
       "",
-      `\`PUT /api/agents/${agentId}/instructions-bundle/file\` with JSON body \`{ "path": "<path>", "content": "<approved content>" }\``,
+      `1. \`GET /api/agents/${agentId}/instructions-bundle/file?path=<path>\` (a 404 means the file is new).`,
+      `2. \`PUT /api/agents/${agentId}/instructions-bundle/file\` with JSON body \`{ "path": "<path>", "content": "<approved content>", "baseHash": <contentHash from step 1, or null for a new file> }\`.`,
       "",
+      "The base is required: the route rejects writes without it (422) and rejects stale bases (409). On a 409 the file changed after this approval. Stop and get the newer edit reviewed; do not overwrite it.",
       "Agent-authenticated callers receive 403 by design; do not work around the gate.",
     ].join("\n"),
     "## Proof of application",
     [
-      `After the write(s), \`GET /api/agents/${agentId}/config-revisions\` must show a new revision with \`source: "instructions_bundle_file_put"\`.`,
-      "Record the resulting config-revision id on this issue before closing it.",
+      "Each PUT response carries the written file's `contentHash`. It must equal the expected hash listed under that file below.",
+      "Record each file's returned `contentHash` on this issue before closing it.",
     ].join("\n"),
     `## Approved bundle (fingerprint \`${fingerprint}\`)`,
     fileSections,
@@ -182,64 +190,63 @@ export async function createInstructionApplyTask(
     }
 
     const fingerprint = computeInstructionBundleFingerprint(agentId, files);
-
-    const existing = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, INSTRUCTION_APPLY_ORIGIN_KIND),
-          eq(issues.originId, agentId),
-          eq(issues.originFingerprint, fingerprint),
-          isNull(issues.hiddenAt),
-          notInArray(issues.status, APPLY_TASK_TERMINAL_STATUSES),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-    if (existing) {
-      await logActivity(db, {
-        companyId,
-        actorType: "system",
-        actorId: "instruction_apply_hook",
-        action: "approval.apply_task_deduped",
-        entityType: "issue",
-        entityId: existing.id,
-        details: { approvalId, agentId, fingerprint },
-      });
-      return { issueId: existing.id, created: false };
-    }
-
     const note = typeof payload.note === "string" && payload.note.trim() ? payload.note.trim() : null;
-    const issue = await issueService(db).create(companyId, {
-      title: `Apply approved instruction bundle — ${agent.name}`,
-      description: buildApplyTaskDescription({
-        agentId,
-        agentName: agent.name,
-        approvalId,
-        fingerprint,
-        files,
-        note,
-      }),
-      status: "todo",
-      priority: "high",
-      originKind: INSTRUCTION_APPLY_ORIGIN_KIND,
-      originId: agentId,
-      originFingerprint: fingerprint,
-      createdByUserId: decidedByUserId,
+
+    // Lookup and insert share one lock so concurrent approvals of the same bundle yield one task.
+    const result = await db.transaction(async (tx) => {
+      const lockKey = `${INSTRUCTION_APPLY_ORIGIN_KIND}:${companyId}:${agentId}:${fingerprint}`;
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      const existing = await tx
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.originKind, INSTRUCTION_APPLY_ORIGIN_KIND),
+            eq(issues.originId, agentId),
+            eq(issues.originFingerprint, fingerprint),
+            isNull(issues.hiddenAt),
+            notInArray(issues.status, APPLY_TASK_TERMINAL_STATUSES),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (existing) return { issueId: existing.id, created: false };
+
+      const issue = await issueService(db).create(
+        companyId,
+        {
+          title: `Apply approved instruction bundle — ${agent.name}`,
+          description: buildApplyTaskDescription({
+            agentId,
+            agentName: agent.name,
+            approvalId,
+            fingerprint,
+            files,
+            note,
+          }),
+          status: "todo",
+          priority: "high",
+          originKind: INSTRUCTION_APPLY_ORIGIN_KIND,
+          originId: agentId,
+          originFingerprint: fingerprint,
+          createdByUserId: decidedByUserId,
+        },
+        tx,
+      );
+      return { issueId: issue.id, created: true };
     });
 
     await logActivity(db, {
       companyId,
       actorType: "system",
       actorId: "instruction_apply_hook",
-      action: "approval.apply_task_created",
+      action: result.created ? "approval.apply_task_created" : "approval.apply_task_deduped",
       entityType: "issue",
-      entityId: issue.id,
+      entityId: result.issueId,
       details: { approvalId, agentId, fingerprint },
     });
 
-    return { issueId: issue.id, created: true };
+    return result;
   } catch (err) {
     logger.error(
       { err, companyId, approvalId },

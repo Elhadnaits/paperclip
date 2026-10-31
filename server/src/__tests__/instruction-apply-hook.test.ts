@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INSTRUCTION_APPLY_ORIGIN_KIND,
@@ -29,7 +30,10 @@ function createDbStub(selectResults: unknown[][]) {
   const where = vi.fn(async () => pendingSelectResults.shift() ?? []);
   const from = vi.fn(() => ({ where }));
   const select = vi.fn(() => ({ from }));
-  return { db: { select } as any, where };
+  const execute = vi.fn(async () => undefined);
+  const tx = { select, execute };
+  const transaction = vi.fn(async (fn: (tx: unknown) => unknown) => fn(tx));
+  return { db: { select, transaction } as any, tx, execute, where };
 }
 
 const bundlePayload = {
@@ -47,7 +51,7 @@ describe("createInstructionApplyTask", () => {
   });
 
   it("creates a board-auth apply task carrying the approved bundle", async () => {
-    const { db } = createDbStub([[agentRow], []]);
+    const { db, tx, execute } = createDbStub([[agentRow], []]);
 
     const result = await createInstructionApplyTask(db, {
       companyId: "company-1",
@@ -58,8 +62,11 @@ describe("createInstructionApplyTask", () => {
 
     expect(result).toEqual({ issueId: "issue-1", created: true });
     expect(mockIssueService.create).toHaveBeenCalledTimes(1);
-    const [companyId, data] = mockIssueService.create.mock.calls[0];
+    const [companyId, data, createTx] = mockIssueService.create.mock.calls[0];
     expect(companyId).toBe("company-1");
+    // Lookup and insert run in the same locked transaction
+    expect(createTx).toBe(tx);
+    expect(execute).toHaveBeenCalledTimes(1);
     expect(data.title).toBe("Apply approved instruction bundle — Kai");
     expect(data.status).toBe("todo");
     expect(data.originKind).toBe(INSTRUCTION_APPLY_ORIGIN_KIND);
@@ -68,7 +75,11 @@ describe("createInstructionApplyTask", () => {
       computeInstructionBundleFingerprint("agent-1", bundlePayload.bundle.files),
     );
     expect(data.description).toContain("PUT /api/agents/agent-1/instructions-bundle/file");
-    expect(data.description).toContain('source: "instructions_bundle_file_put"');
+    expect(data.description).toContain("GET /api/agents/agent-1/instructions-bundle/file?path=<path>");
+    expect(data.description).toContain('"baseHash": <contentHash from step 1, or null for a new file>');
+    expect(data.description).toContain(
+      `Expected \`contentHash\` after the write: \`${createHash("sha256").update("# Managed instructions\n").digest("hex")}\``,
+    );
     expect(data.description).toContain("# Managed instructions");
     expect(mockLogActivity).toHaveBeenCalledWith(
       db,
