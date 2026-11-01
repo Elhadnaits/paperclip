@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpError } from "../errors.ts";
 import {
   INSTRUCTION_APPLY_ORIGIN_KIND,
   computeInstructionBundleFingerprint,
@@ -22,6 +23,22 @@ vi.mock("../services/activity-log.js", () => ({
 vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), error: vi.fn() },
 }));
+
+const mockReadFile = vi.hoisted(() => vi.fn());
+const mockReadCommittedForRuntime = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/agent-instructions.js", () => ({
+  agentInstructionsBundleMode: vi.fn(() => "managed"),
+  agentInstructionsService: vi.fn(() => ({ readFile: mockReadFile })),
+  deriveBundleState: vi.fn(() => ({ entryFile: "AGENTS.md" })),
+}));
+
+vi.mock("../services/agent-instruction-revisions.js", () => ({
+  agentInstructionRevisionService: vi.fn(() => ({ readCommittedForRuntime: mockReadCommittedForRuntime })),
+}));
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const ENTRY_BASE = sha256("# Current entry\n");
 
 const agentRow = { id: "agent-1", companyId: "company-1", name: "Kai" };
 
@@ -48,6 +65,8 @@ describe("createInstructionApplyTask", () => {
     vi.clearAllMocks();
     mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.create.mockResolvedValue({ id: "issue-1" });
+    mockReadCommittedForRuntime.mockResolvedValue({ revision: { contentHash: ENTRY_BASE } });
+    mockReadFile.mockRejectedValue(new HttpError(404, "Instructions file not found"));
   });
 
   it("creates a board-auth apply task carrying the approved bundle", async () => {
@@ -75,15 +94,87 @@ describe("createInstructionApplyTask", () => {
       computeInstructionBundleFingerprint("agent-1", bundlePayload.bundle.files),
     );
     expect(data.description).toContain("PUT /api/agents/agent-1/instructions-bundle/file");
-    expect(data.description).toContain("GET /api/agents/agent-1/instructions-bundle/file?path=<path>");
-    expect(data.description).toContain('"baseHash": <contentHash from step 1, or null for a new file>');
+    expect(data.description).not.toContain("GET /api/agents/agent-1/instructions-bundle/file");
+    expect(data.description).toContain('"baseHash": <reviewed base listed under that file>');
+    // The entry file is pinned to its committed revision at approval time
+    expect(data.description).toContain(`Reviewed base: \`${ENTRY_BASE}\``);
     expect(data.description).toContain(
-      `Expected \`contentHash\` after the write: \`${createHash("sha256").update("# Managed instructions\n").digest("hex")}\``,
+      `Expected \`contentHash\` after the write: \`${sha256("# Managed instructions\n")}\``,
     );
     expect(data.description).toContain("# Managed instructions");
     expect(mockLogActivity).toHaveBeenCalledWith(
       db,
       expect.objectContaining({ action: "approval.apply_task_created" }),
+    );
+  });
+
+  it("keeps a review base recorded in the payload instead of reading the current file", async () => {
+    const { db } = createDbStub([[agentRow], []]);
+    const reviewedBase = sha256("# Reviewed entry\n");
+
+    await createInstructionApplyTask(db, {
+      companyId: "company-1",
+      approvalId: "approval-base",
+      decidedByUserId: "board",
+      payload: {
+        agentId: "agent-1",
+        bundle: { files: [{ path: "AGENTS.md", content: "# Managed instructions\n", baseHash: reviewedBase }] },
+      },
+    });
+
+    const [, data] = mockIssueService.create.mock.calls[0];
+    expect(data.description).toContain(`Reviewed base: \`${reviewedBase}\``);
+    expect(mockReadCommittedForRuntime).not.toHaveBeenCalled();
+    expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it("pins other managed files to their approval-time hash, or null when they do not exist yet", async () => {
+    const { db } = createDbStub([[agentRow], []]);
+    const soulBase = sha256("# Soul\n");
+    mockReadFile.mockImplementation(async (_agent: unknown, path: string) => {
+      if (path === "SOUL.md") return { path, contentHash: soulBase };
+      throw new HttpError(404, "Instructions file not found");
+    });
+
+    await createInstructionApplyTask(db, {
+      companyId: "company-1",
+      approvalId: "approval-files",
+      decidedByUserId: "board",
+      payload: {
+        agentId: "agent-1",
+        bundle: {
+          files: [
+            { path: "SOUL.md", content: "# Soul v2\n" },
+            { path: "TOOLS.md", content: "# Tools\n" },
+          ],
+        },
+      },
+    });
+
+    const [, data] = mockIssueService.create.mock.calls[0];
+    expect(data.description).toContain(`### \`SOUL.md\`\n\nReviewed base: \`${soulBase}\``);
+    expect(data.description).toContain("### `TOOLS.md`\n\nReviewed base: `null` (new file)");
+    expect(mockReadCommittedForRuntime).not.toHaveBeenCalled();
+  });
+
+  it("rejects a payload whose review base is not a content hash", async () => {
+    const { db } = createDbStub([]);
+
+    const result = await createInstructionApplyTask(db, {
+      companyId: "company-1",
+      approvalId: "approval-bad-base",
+      decidedByUserId: "board",
+      payload: {
+        agentId: "agent-1",
+        bundle: { files: [{ path: "AGENTS.md", content: "x", baseHash: "rev-1" }] },
+      },
+    });
+
+    expect(result).toBeNull();
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({ action: "instruction_apply_hook.invalid_payload" }),
     );
   });
 

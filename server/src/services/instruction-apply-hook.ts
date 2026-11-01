@@ -2,8 +2,12 @@ import { createHash } from "node:crypto";
 import { and, eq, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, issues } from "@paperclipai/db";
+import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { instructionPath } from "./agent-instruction-files.js";
+import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
+import { agentInstructionsBundleMode, agentInstructionsService, deriveBundleState } from "./agent-instructions.js";
 import { issueService } from "./issues.js";
 
 /**
@@ -18,7 +22,15 @@ const APPLY_TASK_TERMINAL_STATUSES = ["done", "cancelled"];
 export interface InstructionBundleFile {
   path: string;
   content: string;
+  /** contentHash the proposal was reviewed against (null = new file); absent = not recorded. */
+  baseHash?: string | null;
 }
+
+interface ReviewedInstructionFile extends InstructionBundleFile {
+  baseHash: string | null;
+}
+
+const CONTENT_HASH_PATTERN = /^[a-f0-9]{64}$/;
 
 export interface CreateInstructionApplyTaskInput {
   companyId: string;
@@ -49,11 +61,41 @@ function parseBundleFiles(payload: Record<string, unknown>): InstructionBundleFi
   const files: InstructionBundleFile[] = [];
   for (const entry of rawFiles) {
     if (typeof entry !== "object" || entry === null) return null;
-    const { path, content } = entry as Record<string, unknown>;
+    const { path, content, baseHash } = entry as Record<string, unknown>;
     if (typeof path !== "string" || !path.trim() || typeof content !== "string") return null;
-    files.push({ path, content });
+    if (baseHash === undefined) {
+      files.push({ path, content });
+    } else if (baseHash === null || (typeof baseHash === "string" && CONTENT_HASH_PATTERN.test(baseHash))) {
+      files.push({ path, content, baseHash });
+    } else {
+      return null;
+    }
   }
   return files;
+}
+
+/**
+ * Current `contentHash` of an instructions-bundle file, read the same way as
+ * `GET /agents/:id/instructions-bundle/file`; null when the file does not exist yet.
+ */
+async function currentContentHash(
+  db: Db,
+  agent: typeof agents.$inferSelect,
+  path: string,
+): Promise<string | null> {
+  if (agentInstructionsBundleMode(agent) !== "external" && instructionPath(path) === deriveBundleState(agent).entryFile) {
+    const snapshot = await agentInstructionRevisionService(db).readCommittedForRuntime({
+      companyId: agent.companyId,
+      agentId: agent.id,
+    });
+    if (snapshot) return snapshot.revision.contentHash;
+  }
+  try {
+    return (await agentInstructionsService(db).readFile(agent, path)).contentHash ?? null;
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 404) return null;
+    throw err;
+  }
 }
 
 /** Stable fingerprint of an approved bundle: same agent + same file set = same fingerprint. */
@@ -80,7 +122,7 @@ function buildApplyTaskDescription(input: {
   agentName: string;
   approvalId: string;
   fingerprint: string;
-  files: InstructionBundleFile[];
+  files: ReviewedInstructionFile[];
   note: string | null;
 }): string {
   const { agentId, agentName, approvalId, fingerprint, files, note } = input;
@@ -93,6 +135,7 @@ function buildApplyTaskDescription(input: {
       const fence = "`".repeat(Math.max(4, longestBacktickRun + 1));
       return (
         `### \`${file.path}\`\n\n` +
+        `Reviewed base: ${file.baseHash === null ? "`null` (new file)" : `\`${file.baseHash}\``}\n\n` +
         `Expected \`contentHash\` after the write: \`${contentSha256(file.content)}\`\n\n` +
         fence +
         "markdown\n" +
@@ -113,12 +156,9 @@ function buildApplyTaskDescription(input: {
       : null,
     "## How to execute (board-authenticated callers only)",
     [
-      "For each approved file below, read its current state, then write it through the gated route:",
+      `For each approved file below, \`PUT /api/agents/${agentId}/instructions-bundle/file\` with JSON body \`{ "path": "<path>", "content": "<approved content>", "baseHash": <reviewed base listed under that file> }\`.`,
       "",
-      `1. \`GET /api/agents/${agentId}/instructions-bundle/file?path=<path>\` (a 404 means the file is new).`,
-      `2. \`PUT /api/agents/${agentId}/instructions-bundle/file\` with JSON body \`{ "path": "<path>", "content": "<approved content>", "baseHash": <contentHash from step 1, or null for a new file> }\`.`,
-      "",
-      "The base is required: the route rejects writes without it (422) and rejects stale bases (409). On a 409 the file changed after this approval. Stop and get the newer edit reviewed; do not overwrite it.",
+      "The reviewed base is the file's state when this bundle was approved, so the route rejects the write (409) if the file changed since. On a 409, stop and get the newer edit reviewed. Do not re-read the file and retry with its new hash: that would overwrite the newer edit.",
       "Agent-authenticated callers receive 403 by design; do not work around the gate.",
     ].join("\n"),
     "## Proof of application",
@@ -189,6 +229,15 @@ export async function createInstructionApplyTask(
       return null;
     }
 
+    // Files without a recorded review base are pinned to their state at approval time,
+    // so a later edit makes the apply write 409 instead of being overwritten.
+    const reviewedFiles: ReviewedInstructionFile[] = await Promise.all(
+      files.map(async (file) => ({
+        ...file,
+        baseHash: file.baseHash !== undefined ? file.baseHash : await currentContentHash(db, agent, file.path),
+      })),
+    );
+
     const fingerprint = computeInstructionBundleFingerprint(agentId, files);
     const note = typeof payload.note === "string" && payload.note.trim() ? payload.note.trim() : null;
 
@@ -221,7 +270,7 @@ export async function createInstructionApplyTask(
             agentName: agent.name,
             approvalId,
             fingerprint,
-            files,
+            files: reviewedFiles,
             note,
           }),
           status: "todo",
